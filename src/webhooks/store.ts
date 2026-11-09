@@ -1,3 +1,4 @@
+import { routinePayload } from './routine.ts';
 import { allowsProject, expandProjectAccess, projectAccess, projectFilter, projectDenied } from '../oauth/projectAccess.ts';
 import type { CredentialAlertPayload } from '../hosts/alerts.ts';
 import type { GatewayConfig } from '../config.ts';
@@ -100,6 +101,7 @@ export interface ClaimedDelivery {
   lease: string; attempt: number; expiresAt: number; route: WebhookRoute;
 }
 function eventType(event: JobEvent): WebhookEventType | undefined {
+  if (event.type === 'created' && event.detail?.reason === 'adopted') return 'adopted';
   if ((event.type === 'state_changed' || event.type === 'turn_finished') && event.detail?.reason === 'run_failed') return 'failed';
   if (event.type === 'pull_request_opened' || event.type === 'pull_request_merged') return event.type;
   if (event.type === 'delegated_work_ended') return 'delegated_work_ended';
@@ -306,7 +308,17 @@ export class WebhookStore {
     }
     for (const row of matches) {
       const s = JSON.parse(row.settings) as SubscriptionSettings;
+      const route = JSON.parse(row.route) as WebhookRoute;
       const body = { ...payload };
+      if (route.routine) {
+        // Validate the original authenticated link before reducing it to a safe native identity.
+        // Never archive an arbitrary HTTPS URL or substitute the configured environment into it.
+        try {
+          const mapped = routinePayload({ ...payload, link: job.threadLink }, route.routine);
+          if (mapped === null) continue;
+          body.link = `t3-thread://v2/${mapped.environment_id}/${mapped.thread_id}`;
+        } catch { /* retain sanitized identity; sender fails closed */ }
+      }
       if (s.excerptChars > 0) {
         body.excerpt = excerpt(job.latestMessageExcerpt, s.excerptChars);
         body.excerptTruncated = job.latestMessageTruncated || (body.excerpt?.length ?? 0) < (job.latestMessageExcerpt?.length ?? 0);

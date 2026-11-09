@@ -3,7 +3,8 @@ import { request as httpRequest, type ClientRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import type { Logger } from '../log.ts';
 import type { Clock } from '../time.ts';
-import { loadRoute, type SubscriptionConfig, type WebhookRoute } from './config.ts';
+import { routinePayload } from './routine.ts';
+import { resolveRuntimeRoute, loadRoute, type SubscriptionConfig, type WebhookRoute } from './config.ts';
 import { WebhookStore, type AttemptResult } from './store.ts';
 
 export const ATTEMPT_TIMEOUT_MS = 10_000;
@@ -32,6 +33,12 @@ export function postWebhook(route: WebhookRoute, payload: string, timeoutMs = AT
     if (signal?.aborted) { finish('stopped'); return; }
     signal?.addEventListener('abort', abort, { once: true });
     try {
+      route = resolveRuntimeRoute(route);
+      if (route.routine) {
+        const mapped = routinePayload(JSON.parse(payload), route.routine);
+        if (!mapped) throw new Error();
+        payload = JSON.stringify(mapped);
+      }
       const url = new URL(route.url);
       request = (url.protocol === 'https:' ? httpsRequest : httpRequest)(url, {
         method: 'POST', agent: false, maxHeaderSize: 16 * 1024,
