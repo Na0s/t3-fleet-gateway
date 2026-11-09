@@ -100,10 +100,20 @@ function withServices<T>(paths: Paths, logger: Logger, env: NodeJS.ProcessEnv, f
 
 async function serve(paths: Paths, io: CliIo): Promise<number> {
   const logger = logLevelLogger(io.env, (line) => io.out(line), 'info');
-  const config = loadConfig(paths.configPath);
+  let config = loadConfig(paths.configPath);
+  let commandEnv = io.env;
+  if (io.env.T3FG_RUNTIME_ROUTES) {
+    const { readRuntimeManifest, prepareRuntime, serviceEnvironment } = await import('../webhooks/runtimeLoader.ts');
+    const prepared = await prepareRuntime(config, readRuntimeManifest(io.env.T3FG_RUNTIME_ROUTES), io.env);
+    config = prepared.config;
+    commandEnv = serviceEnvironment(prepared.env);
+    io = { ...io, env: prepared.env };
+    for (const name of Object.keys(process.env)) if (!(name in prepared.env)) delete process.env[name];
+    Object.assign(process.env, prepared.env);
+  }
   const guard = guardProcess(logger);
   try {
-    const gateway = await startGateway({ config, dataDir: paths.dataDir, logger, commandEnv: io.env, ...(io.listenPort === undefined ? {} : { port: io.listenPort }) });
+    const gateway = await startGateway({ config, dataDir: paths.dataDir, logger, commandEnv, ...(io.listenPort === undefined ? {} : { port: io.listenPort }) });
     const fatal = await Promise.race([(io.waitForShutdown ?? waitForSignal)(gateway).then(() => false), guard.fatal.then(() => true)]);
     if (!fatal) {
       await gateway.close();

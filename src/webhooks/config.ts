@@ -1,10 +1,12 @@
+import { createHash } from 'node:crypto';
+import { routineOptionsSchema } from './routine.ts';
 import { constants, closeSync, fstatSync, openSync, readFileSync } from 'node:fs';
 import { validateHeaderName, validateHeaderValue } from 'node:http';
 import { join } from 'node:path';
 import * as z from 'zod';
 import { GatewayError } from '../errors.ts';
 
-export const WEBHOOK_EVENTS = ['needs_input', 'idle', 'failed', 'cancelled', 'delegated_work_ended', 'running', 'pull_request_opened', 'pull_request_merged', 'credential_alert', 'credential_resolved'] as const;
+export const WEBHOOK_EVENTS = ['needs_input', 'idle', 'failed', 'cancelled', 'delegated_work_ended', 'running', 'pull_request_opened', 'pull_request_merged', 'credential_alert', 'credential_resolved', 'adopted'] as const;
 export type WebhookEventType = (typeof WEBHOOK_EVENTS)[number];
 export const DEFAULT_WEBHOOK_EVENTS: WebhookEventType[] = ['needs_input', 'idle', 'failed', 'cancelled', 'delegated_work_ended', 'credential_alert', 'credential_resolved'];
 // Track schema-defaulted arrays without adding private parser metadata to persisted settings.
@@ -35,6 +37,7 @@ export const preciseFilters = {
 };
 export type PreciseFilters = { jobs?: string[]; clients?: string[]; events?: WebhookEventType[] };
 
+const ENV_REFERENCE = /^env:([A-Z][A-Z0-9_]{0,127})$/;
 const subscriptionSchema = z.strictObject({
   id: z.string().regex(/^[a-z0-9][a-z0-9-]{0,63}$/),
   enabled: z.boolean().default(false),
@@ -42,8 +45,9 @@ const subscriptionSchema = z.strictObject({
   auth: z.strictObject({
     header: z.string().min(1).max(128).refine(authHeaderAllowed),
     // A filename within the private data directory, never an arbitrary path or symlink.
-    secretFile: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/),
+    secretFile: z.string().refine((value) => /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value) || ENV_REFERENCE.test(value)),
   }),
+  routine: routineOptionsSchema.optional(),
   projects: z.array(z.string().min(1).max(300)).min(1).max(100).optional(),
   hosts: z.array(z.string().regex(/^[a-z0-9][a-z0-9-]{0,31}$/)).min(1).max(100).optional(),
   targets: z.array(z.strictObject({ host: z.string().regex(/^[a-z0-9][a-z0-9-]{0,31}$/),
@@ -57,7 +61,11 @@ const subscriptionSchema = z.strictObject({
   }),
   excerptChars: z.int().min(0).max(500).default(0),
   allowLoopbackHttp: z.boolean().default(false),
-}).refine((value) => destinationAllowed(value.url, value.allowLoopbackHttp))
+}).refine((value) => ENV_REFERENCE.test(value.url)
+  ? ENV_REFERENCE.test(value.auth.secretFile) && !value.allowLoopbackHttp
+  : !ENV_REFERENCE.test(value.auth.secretFile) && destinationAllowed(value.url, value.allowLoopbackHttp))
+  .refine((value) => !value.routine || (ENV_REFERENCE.test(value.url) && value.excerptChars === 0 && value.hosts?.length === 1 &&
+    value.events.every((event) => ['idle', 'needs_input', 'failed', 'cancelled', 'delegated_work_ended', 'running', 'adopted'].includes(event))))
   .refine((value) => !value.ownerClientId || (!!value.hosts?.length && value.excerptChars === 0));
 
 export const webhooksSchema = z.strictObject({
@@ -70,11 +78,47 @@ export function usesDefaultEvents(subscription: SubscriptionConfig): boolean {
   return defaultEventSelections.has(subscription.events);
 }
 /** Private route material. Never returned by diagnostics or logged. */
-export interface WebhookRoute { url: string; header: string; value: string }
+export interface WebhookRoute {
+  url: string; header: string; value: string;
+  runtimeFingerprint?: string;
+  routine?: z.output<typeof routineOptionsSchema>;
+}
 
-export function loadRoute(subscription: SubscriptionConfig, dataDir: string): WebhookRoute {
+function fingerprint(route: WebhookRoute): string {
+  return createHash('sha256').update(JSON.stringify([route.url, route.header, route.value])).digest('hex');
+}
+
+/** Resolve only an explicitly paired runtime route; never persist the returned material. */
+export function resolveRuntimeRoute(route: WebhookRoute, env: NodeJS.ProcessEnv = process.env): WebhookRoute {
+  try {
+    if (!route.runtimeFingerprint) return route;
+    const urlName = ENV_REFERENCE.exec(route.url)?.[1];
+    const valueName = ENV_REFERENCE.exec(route.value)?.[1];
+    if (!urlName || !valueName) throw new Error();
+    const resolved = { url: env[urlName] ?? '', header: route.header, value: env[valueName] ?? '' };
+    if (resolved.url.length > 4096 || !destinationAllowed(resolved.url, false) || !authHeaderAllowed(resolved.header) ||
+        !resolved.value.trim() || Buffer.byteLength(resolved.value) > 8192) throw new Error();
+    validateHeaderValue(resolved.header, resolved.value);
+    if (fingerprint(resolved) !== route.runtimeFingerprint) throw new Error();
+    return { ...resolved, ...(route.routine ? { routine: route.routine } : {}) };
+  } catch {
+    throw new GatewayError('config_invalid', 'Runtime webhook route unavailable or changed; reload validated runtime credentials and restart.');
+  }
+}
+
+export function loadRoute(subscription: SubscriptionConfig, dataDir: string, env: NodeJS.ProcessEnv = process.env): WebhookRoute {
   let fd: number | undefined;
   try {
+    if (ENV_REFERENCE.test(subscription.url)) {
+      const urlName = ENV_REFERENCE.exec(subscription.url)![1]!;
+      const valueName = ENV_REFERENCE.exec(subscription.auth.secretFile)?.[1];
+      if (!valueName) throw new Error();
+      const route: WebhookRoute = { url: subscription.url, header: subscription.auth.header.toLowerCase(), value: subscription.auth.secretFile,
+        runtimeFingerprint: fingerprint({ url: env[urlName] ?? '', header: subscription.auth.header.toLowerCase(), value: env[valueName] ?? '' }),
+        ...(subscription.routine ? { routine: subscription.routine } : {}) };
+      resolveRuntimeRoute(route, env);
+      return route;
+    }
     if (!destinationAllowed(subscription.url, subscription.allowLoopbackHttp) || !authHeaderAllowed(subscription.auth.header)) throw new Error();
     // Opening a FIFO without a writer would block before fstat can reject it. Regular files ignore O_NONBLOCK.
     fd = openSync(join(dataDir, subscription.auth.secretFile), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
@@ -84,7 +128,7 @@ export function loadRoute(subscription: SubscriptionConfig, dataDir: string): We
     const value = readFileSync(fd, 'utf8').replace(/\r?\n$/, '');
     if (!value.trim()) throw new Error();
     validateHeaderValue(subscription.auth.header, value);
-    return { url: subscription.url, header: subscription.auth.header.toLowerCase(), value };
+    return { url: subscription.url, header: subscription.auth.header.toLowerCase(), value, ...(subscription.routine ? { routine: subscription.routine } : {}) };
   } catch {
     // No filesystem path, header name/value, URL, or raw Node error crosses this boundary.
     throw new GatewayError('config_invalid', 'Webhook authentication or destination is invalid; check the private secret file and configuration.');

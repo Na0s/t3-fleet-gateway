@@ -499,7 +499,35 @@ payloads. Health begins at upgrade; no historical success or event snapshots are
 users and back up before upgrading. Older builds refuse the new schema; rollback requires restoring the
 pre-upgrade backup and loses subsequent ledger changes. No version bump or live deployment is part of this work.
 
+### Runtime routes and routine receivers
+
+Operator configuration may opt into paired `env:` URL/auth references. Persist only references
+and a fingerprint of the resolved tuple; validate the tuple again before every POST. Rotation
+changes route identity and cancels the previous queue. Runtime routes require HTTPS. The optional
+startup manifest loader requests only selected variables from explicitly enrolled Fleet accounts,
+excludes parent credentials from subprocess environments, and performs no retrieval for disabled
+routes. Readiness checks neither open the ledger nor send requests. See configuration.md,
+"Runtime-only webhook credentials and routine payloads", for the manifest and rollback contract.
+
+Routine receivers opt into a fixed five-field payload, one host, a pinned environment and bot,
+zero excerpts, and explicit lifecycle events. Capture validates the original authenticated native
+v2, configured-origin HTTPS or official T3 app link, then records only its native v2 identity.
+Foreign, malformed or mismatched identities cannot send. Generic routes retain their existing
+safe-link policy. The canonical event remains available for authorization/replay; transmission
+maps it deterministically to the receiver contract, including its stable UUID in the summary.
+Idle with delegated work is suppressed; other idle notices request review of the finished turn.
+Adoption emits only the explicitly selected `adopted` event and replayed adoption emits none.
+Synthetic pings lack authenticated thread identity and cannot test routine routes. Receiver-side
+deduplication remains necessary for retries after ambiguous acknowledgements.
+
 ## Downstream T3 credentials
+
+Native credential persistence seals new host tokens with AES-256-GCM, independent nonces and
+host-bound associated data under a purpose-derived key from the private Gateway server key.
+Missing or invalid native keys fail closed. Legacy plaintext rows remain readable until renewal
+replaces them; standalone no-key fixtures retain legacy behavior. Backups need both the database
+and its matching server key. This protects storage from plaintext disclosure, not from the same
+user or a backup containing both artifacts; older builds cannot open sealed values.
 
 Per host, the gateway obtains a T3 MCP credential with T3's documented pairing-code approval, with no browser:
 

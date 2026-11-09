@@ -1,3 +1,7 @@
+import { createCipheriv, createDecipheriv, createHmac, randomBytes } from 'node:crypto';
+import { existsSync, readFileSync, lstatSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { GatewayError } from '../errors.ts';
 import type { T3Access } from '../config.ts';
 import { transaction, type Database } from '../db/database.ts';
 import type { ObtainedCredential } from '../t3/pairing.ts';
@@ -17,13 +21,48 @@ export interface RenewalRecord {
 
 /**
  * T3 credentials per host. These are bearer tokens the gateway must present, so they are stored
- * as-is in the private database; they never leave the gateway or appear in logs and tool output.
+ * encrypted in native data directories with a purpose-derived local key; they never appear in logs or tool output.
+ * The local server key must accompany backups. Same-user access remains trusted. Legacy plaintext rows are read without migration.
  */
 export class CredentialStore {
   readonly #db: Database;
+  readonly #key: Buffer | undefined;
 
-  constructor(db: Database) {
+  constructor(db: Database, requireEncryption = false) {
     this.#db = db;
+    // Native data directories already contain a private server key. Memory-only fixtures need no at-rest envelope.
+    const file = String(db.prepare('PRAGMA database_list').get()?.file ?? '');
+    const keyFile = file ? join(dirname(file), 'gateway.key') : '';
+    if (keyFile && existsSync(keyFile)) {
+      const stat = lstatSync(keyFile);
+      if (!stat.isFile() || (stat.mode & 0o077) !== 0 ||
+          (typeof process.getuid === 'function' && stat.uid !== process.getuid())) throw new GatewayError('data_dir_insecure', 'Credential wrapping key is not private.');
+      const key = readFileSync(keyFile);
+      if (key.length !== 32) throw new GatewayError('data_dir_insecure', 'Credential wrapping key is invalid.');
+      this.#key = createHmac('sha256', key).update('t3-fleet-gateway/host-token/v1').digest();
+    }
+    if (requireEncryption && !this.#key) throw new GatewayError('data_dir_insecure', 'Native credential persistence requires the private wrapping key.');
+  }
+
+  #seal(hostId: string, token: string): string {
+    if (!this.#key) return token;
+    const nonce = randomBytes(12);
+    const cipher = createCipheriv('aes-256-gcm', this.#key, nonce);
+    cipher.setAAD(Buffer.from(hostId));
+    const ciphertext = Buffer.concat([cipher.update(token, 'utf8'), cipher.final()]);
+    return 'sealed:v1:' + Buffer.concat([nonce, cipher.getAuthTag(), ciphertext]).toString('base64url');
+  }
+
+  #open(hostId: string, value: string): string {
+    if (!value.startsWith('sealed:v1:')) return value; // Read-only legacy compatibility; new native writes are sealed.
+    try {
+      if (!this.#key) throw new Error();
+      const bytes = Buffer.from(value.slice('sealed:v1:'.length), 'base64url');
+      if (bytes.length < 29) throw new Error();
+      const decipher = createDecipheriv('aes-256-gcm', this.#key, bytes.subarray(0, 12));
+      decipher.setAAD(Buffer.from(hostId)); decipher.setAuthTag(bytes.subarray(12, 28));
+      return Buffer.concat([decipher.update(bytes.subarray(28)), decipher.final()]).toString('utf8');
+    } catch { throw new GatewayError('data_dir_insecure', 'Stored host credential cannot be opened with this data directory key.'); }
   }
 
   get(hostId: string): StoredCredential | undefined {
@@ -43,7 +82,7 @@ export class CredentialStore {
     return {
       hostId: row.host_id,
       t3ClientId: row.t3_client_id,
-      accessToken: row.access_token,
+      accessToken: this.#open(hostId, row.access_token),
       scope: row.scope,
       access: row.access,
       issuedAt: row.issued_at,
@@ -65,7 +104,7 @@ export class CredentialStore {
       .run(
         credential.hostId,
         credential.t3ClientId,
-        credential.accessToken,
+        this.#seal(credential.hostId, credential.accessToken),
         credential.scope,
         credential.access,
         credential.issuedAt,

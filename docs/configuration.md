@@ -309,3 +309,121 @@ queues and attempts are unchanged. Health/archive begin at upgrade. Stop all led
 before upgrading; any CLI open can migrate the database. Older builds refuse version 18. Rollback
 requires restoring the pre-upgrade backup, losing writes since it was taken. No receiver re-registration
 or key rotation is required.
+
+## Runtime-only webhook credentials and routine payloads
+
+A paired runtime route uses `env:VARIABLE_NAME` in both `url` and `auth.secretFile`.
+For example, an operator can configure `url: "env:ROUTINE_URL"` and
+`auth: { header: "X-Sender-Key", secretFile: "env:ROUTINE_HEADER_VALUE" }`.
+The header name is explicit; the runtime value must already have the receiver's required
+format. The sender never guesses a Bearer prefix or parses a complete header line.
+
+Both variables must be loaded privately into the Gateway process by an authorized runtime
+credential loader. Native `op run` is one option, but supplying the entire Environment also
+exposes all its other secrets to that process; prefer a loader that selects the required
+variables. Service-account tokens must not be inherited by Gateway. Nothing in this extension
+authenticates to 1Password or enrolls a project service account automatically.
+
+Only variable references and a SHA-256 fingerprint of the complete resolved URL/header/value
+tuple enter the route ledger. Values are resolved and checked before sending. Missing values,
+unsafe destinations, invalid headers or tuple changes fail closed without a POST. Runtime routes
+always require HTTPS, even if the synthetic loopback-HTTP flag is present. Restart with newly
+loaded credentials to rotate a route; reconciliation changes the subscription revision and
+cancels the old queue. An unchanged runtime tuple retains its revision across restarts.
+
+Optional `routine` configuration adds `expectedEnvironmentId` and `targetBot`. It requires a
+runtime route, exactly one host, zero excerpts and an explicit event selection from `idle`,
+`needs_input`, `failed`, `cancelled`, `delegated_work_ended`, `running`, `adopted`.
+The operator pins the exact recipient name in private configuration. Configure aliases explicitly
+outside this boundary; no legacy-name fallback or client-supplied recipient selection.
+
+The wire payload has exactly `thread_id`, `environment_id`, `status`, `target_bot`, `summary`.
+Environment and thread must match the authenticated upstream thread link and configured
+expected environment. Native v2 links are accepted directly. For HTTPS links, set
+`routine.expectedT3Origin` to the configured T3 origin; the runtime loader supplies it from
+the route's host. Direct links require that origin and the canonical `/<environment>/<thread>`
+path. Official `https://app.t3.codes/threads/<environment>/<thread>` links are also recognized.
+Both HTTPS forms require exact environment/thread identity and canonical encoding, with no
+userinfo, query or fragment. Foreign origins and legacy v1 links are insufficient; no configured
+ID is substituted into them. Capture validates the original authenticated link before storing a
+native v2 identity in the route's canonical event; arbitrary HTTPS URLs never enter the archive.
+`idle` emits completed with review requested, describing only the finished turn; task
+completion still requires review. An idle turn with delegated work is suppressed. Needs-input,
+failed, cancelled and delegated-work-ended request input/review. Running and the opt-in adopted
+event emit assign. Adoption replay creates no duplicate handoff event. Merely starting a T3
+thread does not automatically adopt it; the session or orchestrator must call work_adopt.
+
+Stable event identity is included in the fixed summary for receiver deduplication. The native
+canonical event stays in the outbox/archive for authorization and feed replay; deterministic
+wire mapping happens only at transmission. Existing retry bounds and delivery tracking remain
+in force. A receiver must deduplicate; five-field JSON compatibility is not proof that an
+existing routine will handle the notice correctly. Synthetic ping lacks an originating thread
+and is refused for routine routes without a POST. Do not use it as a production canary.
+
+Native data-directory T3 bearer-token writes are AES-256-GCM envelopes with independent nonces,
+host-bound associated data and a purpose-derived key from the private Gateway server key.
+The native service refuses to initialize credential persistence without that key. Plaintext
+legacy rows remain readable and are not silently migrated; renewal replaces them with sealed
+values. Back up the database and
+server key together, protect both, and never remove/regenerate a key as a recovery shortcut.
+This is encryption at rest under the same user's authority, not isolation from that user or
+from a backup containing both artifacts. The standalone no-key CredentialStore mode remains
+for isolated legacy fixtures; native openServices requires encryption.
+
+These options are opt-in. Old builds do not resolve `env:` routes and cannot send them; they
+cannot use sealed T3 credentials either. Restore the matching source/key/database together for
+rollback. No real webhook connection or project credential is created by enabling this code.
+
+### Runtime credential loader
+
+Set `T3FG_RUNTIME_ROUTES` to an owner-owned regular 0600 JSON manifest to use the
+selected-variable loader at native `serve` startup. The manifest has `version: 1`,
+a `profiles` map and a `routes` array. Each profile supplies its exact 1Password
+`environmentId`, absolute installed `fleetPath` and `kind` (`enrolled` or
+`legacy-fleet`). Enrolled profiles invoke `fleet account-run` with the manifest
+profile name. The legacy source is restricted to Fleet's existing installed
+profile Environment and preserves that authorized credential without migration.
+It cannot be used as a fallback for another project's enrollment.
+
+Each route supplies `id`, `profile`, `targetBot`, `urlVariable`, `keyVariable`,
+`headerVariable`, `hosts` (one), `expectedEnvironmentId`, explicit `events` and
+`enabled`. Variable names must begin GROKBOT_; no credential literals are accepted.
+Enabled routes additionally require explicit `jobs` or paired `targets` filters.
+Disabled routes cause no account access at service startup. Missing enrolled
+project accounts fail closed; the loader does not request or enroll credentials.
+
+The saved header variable may contain either the exact header name (using the
+saved raw key as its value), or a full name/value header. A full saved header must
+match the saved key exactly, or its explicit Bearer form. No prefix or recipient
+is guessed. Invalid, missing or inconsistent saved fields fail before starting
+Gateway; raw provider diagnostics are discarded. Only selected URL/header values
+enter Gateway memory. Service-account/connect tokens, unrelated Environment
+variables and TLS-bypass settings are excluded. T3 pairing/probe subprocesses
+receive the clean service environment without the injected webhook values.
+
+Each required profile is fetched once at startup, through a private stdout pipe
+with a 45-second deadline and 128 KiB combined output bound. Failure kills the
+provider process group and exposes only a fixed code. There is no loader polling
+loop. Configure the service supervisor with a small start-rate limit to prevent
+repeated provider calls during an enrollment outage.
+
+For a credential-only check, run `node scripts/check-runtime-routes.ts <route-id>`
+with `T3FG_RUNTIME_ROUTES` and the normal Gateway config/data path variables. It
+prints readiness, selected IDs, enabled IDs and zero POST/database-open counts.
+It does not open the database, bind a listener, create a client, reconcile a
+subscription or send a webhook. A successful check is credential-readiness
+evidence, not delivery or receiver-handling evidence. Keep real routes disabled
+until endpoint access, explicit recipient filters and activation are authorized.
+
+Routes without a saved header variable may explicitly select
+`authContract: "grok-bot-bearer"` instead of `headerVariable`. These two fields are
+mutually exclusive; omitting both or using another contract is rejected. This
+named contract implements Grok Bot routine authentication documented at
+https://docs.x.ai/grok-bot/skills-routines-and-automations#webhooks:
+Authorization with the Bearer scheme and the saved raw routine key. It is not the
+HMAC contract for the separate Grok automations product. Keys with whitespace,
+header-line content or an existing Bearer prefix are rejected rather than repaired.
+Only the saved URL/key names are requested; no header variable is invented. Multiple
+selected routes under one enrolled profile share a single bounded account call.
+No request is made by readiness checks, and disabled routes still cause zero
+credential retrievals during service startup.

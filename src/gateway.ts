@@ -83,7 +83,7 @@ export function openServices(options: ServiceOptions): GatewayServices {
   const alerts = new CredentialAlerts(db, clock, config, webhooks);
   const registry = new HostRegistry({
     hosts: config.hosts,
-    store: new CredentialStore(db),
+    store: new CredentialStore(db, true),
     clock,
     logger,
     renewWhenDaysLeft: config.renewal.renewWhenDaysLeft,
