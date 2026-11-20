@@ -661,3 +661,16 @@ The watcher uses `thread.pullRequests` when present and the optional read-only `
 Migration 13 adds nullable `pull_requests` JSON and `pull_requests_checked_at`. NULL is unknown/unbaselined and [] is known empty. Existing/adopted jobs baseline silently. Newly launched/reconciled jobs begin with [] so their first linked open PR is reported. Freshness-only checks do not bump job `updatedAt` or prolong attention. Snapshot, freshness, PR events and webhook outbox commit atomically under the watcher's existing snapshot guard. Each observation emits at most one `pull_request_opened` and one `pull_request_merged` event, each representing all changes of that kind in its snapshot. An unlink or unknown state never implies a merge. A subsequent unlink/relink or reopen can emit a new event. Events compare the two followed lists in full: a PR whose state became open or merged raises the event of that kind, and so does a PR the previous list did not hold, in either state. Only a list at the 200-PR bound is a window onto a longer one: there a PR leaving it raises nothing, and a PR the previous list did not hold counts as new only if it outranks that list's last entry (an old PR coming back into the list because another one left is not news). Below the bound nothing was left out, so a PR that opens and merges between two polls, or a followed PR that merges among more than 20, is reported. The PR an event is about may not be among the 20 shown. Known limit: a stored list of exactly 200 is treated as a window even when T3 listed no more, so on such a job a PR that opens and merges between two polls while older PRs are unlinked can go unreported; telling a complete list of 200 from a cut one would take one more stored bit, which no job has needed.
 
 `work_status`/`work_list` expose only cached authorized metadata, with the last successful check time; terminal jobs stop refreshing. T3's own PR sync can lag GitHub. No GitHub API credential is added, and unlinked PRs or child PRs not linked to the parent remain invisible. PR event details contain fixed reasons only. PR webhook types are opt-in and carry at most 20 references (number/state/URL), without titles or branches, so the payload stays inside its 16 KiB bound for ordinary links however many PRs the job follows (an oversized one is still counted as `payload_limit` overflow). Existing default subscription settings and route identities stay unchanged. Dashboard snapshots reduce at most 20 references per job to number/state and never add arbitrary external links or call T3.
+
+### Explicit bot mentions
+
+The local operator CLI offers `bots list --json` and `bots send --json`; see
+configuration.md, "Named bot mentions". This is separate from lifecycle event
+capture and the jobs ownership model. Catalog reads project no route material.
+Sending validates authenticated environment/thread identity and configured
+project filters, resolves only the selected recipient's runtime credentials,
+and reserves a content fingerprint with `O_EXCL` and fsync before attempting one
+POST. Private receipts under `bot-requests` retain accepted, failed or uncertain
+outcomes across processes and restarts. Reusing a request identity never resends;
+transport uncertainty requires reconciliation, rather than a blind retry.
+No new HTTP or MCP destination-management surface is exposed.

@@ -20,6 +20,11 @@ export const runtimeManifestSchema = z.strictObject({
   routes: z.array(z.strictObject({
     id: slug, profile: slug, enabled: z.boolean().default(false),
     targetBot: z.string().min(1).max(80).regex(/^[^\x00-\x1f\x7f]+$/),
+    presentation: z.strictObject({
+      id: slug.optional(),
+      icon: z.string().min(1).max(16).regex(/^[^\x00-\x1f\x7f<>]+$/).optional(),
+      color: z.string().regex(/^#[0-9a-fA-F]{6}$/).optional(),
+    }).optional(),
     urlVariable: variable, keyVariable: variable, headerVariable: variable.optional(),
     authContract: z.literal('grok-bot-bearer').optional(),
     hosts: z.array(slug).length(1), expectedEnvironmentId: z.string().min(1).max(2048),
