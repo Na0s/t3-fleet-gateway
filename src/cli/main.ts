@@ -1,3 +1,4 @@
+import { runBots } from './bots.ts';
 import { projectAccess, projectGrant, setProjectAccess } from '../oauth/projectAccess.ts';
 import { parseArgs } from 'node:util';
 import { loadConfig, mcpResource, resolvePaths, type GatewayConfig, type Paths } from '../config.ts';
@@ -24,6 +25,8 @@ import { escapeControls, relative, shortTime, table } from './format.ts';
 
 export interface CliIo {
   env: NodeJS.ProcessEnv;
+  /** JSON stdin for explicit bot messages; defaults to process.stdin. */
+  input?: NodeJS.ReadableStream;
   out: (text: string) => void;
   err: (text: string) => void;
   /** Resolves when the process is asked to stop (serve only). Receives the port the gateway listens on. */
@@ -76,6 +79,8 @@ Commands:
   webhooks replay <id> (--after <cursor> | --since <ISO time>) [--limit 200]
                             Requeue retained original events (offline; receiver deduplicates eventId)
   webhooks ping <id>         Test a file-managed or dashboard connection with synthetic content
+  bots list --json          List mentionable bots (display metadata only; no credential lookup)
+  bots send --json          Send one explicit bot message from JSON stdin, without lifecycle activation
   doctor                    Check config, permissions, database, hosts, public URL and dashboard
 
 Options:
@@ -588,6 +593,7 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
       args: [...argv],
       allowPositionals: true,
       options: {
+        json: { type: 'boolean' },
         config: { type: 'string' },
         'data-dir': { type: 'string' },
         ttl: { type: 'string' },
@@ -629,6 +635,7 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
     }
     // Each of these options belongs to one command; anywhere else it would be ignored silently.
     const optionCommands = [
+      ['json', values.json, 'bots list/send', command === 'bots'],
       ['project', values.project, 'clients projects', command === 'clients' && action === 'projects'],
       ['all-projects', values['all-projects'], 'clients projects', command === 'clients' && action === 'projects'],
       ['no-projects', values['no-projects'], 'clients projects', command === 'clients' && action === 'projects'],
@@ -677,6 +684,9 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
         return await jobs(paths, io, action, args, { title: values.title, all: values.all });
       case 'webhooks':
         return await webhooks(paths, io, action, id, values.limit, values.after, values.since);
+      case 'bots':
+        if (!values.json || id !== undefined || !['list', 'send'].includes(action ?? '')) throw new UsageError('Use: bots list --json | bots send --json (JSON stdin)');
+        return await runBots(paths, io, action as 'list' | 'send');
       case 'doctor':
         return await doctor(paths, io);
       default:

@@ -427,3 +427,66 @@ Only the saved URL/key names are requested; no header variable is invented. Mult
 selected routes under one enrolled profile share a single bounded account call.
 No request is made by readiness checks, and disabled routes still cause zero
 credential retrievals during service startup.
+
+### Named bot mentions
+
+The operator command `bots list --json` reads only display metadata from
+`T3FG_RUNTIME_ROUTES`. It opens no database, retrieves no credentials and makes
+no network request. Routes for the same exact `targetBot` share a catalog entry;
+the default ID is its lowercase ASCII slug (a hash is used for names without
+ASCII letters or digits). A collision between different names is refused.
+Optional route `presentation` pins a stable ID, icon and color:
+
+```json
+"presentation": { "id": "reviewer", "icon": "✦", "color": "#A78BFA" }
+```
+
+Use the same presentation on every host route for that bot. IDs are lowercase
+letters, digits and hyphens, up to 64 characters. Colors are `#RRGGBB`; icons are
+short text or emoji, never HTML or a remote image URL. Omitted icons and colors
+have deterministic defaults. The catalog returns `{ "bots": [{ "id", "name",
+"icon", "color" }] }`, with no host, webhook or credential information.
+
+A T3 integration can configure the executable and its fixed arguments, append
+`bots list --json` for discovery, and append `bots send --json` for delivery.
+Send supplies this object through stdin, never shell arguments:
+
+```json
+{
+  "botId": "reviewer",
+  "environmentId": "11111111-1111-4111-8111-111111111111",
+  "threadId": "synthetic-thread",
+  "requestId": "mention:synthetic-message:reviewer",
+  "message": "Please review the linked thread."
+}
+```
+
+The command chooses exactly one bot route matching the environment, checks the
+host's authenticated environment and thread identity, checks project targets if
+configured, and only then loads that route's selected credentials. Job-filtered
+routes are refused: configure a dedicated route with explicit project targets
+for mentions. Unknown, ambiguous, archived or mismatched targets send nothing.
+An explicit mention works independently of `enabled`, which continues to govern
+only automatic lifecycle notifications. It neither adopts a job nor changes
+subscriptions, grants, thread ownership or routine configuration.
+
+Delivery uses the existing HTTPS transport and pinned `targetBot` in the routine's
+five-field JSON contract. The status is `needs_input`; the summary contains the
+explicit message and a stable message identity, with no implied ownership
+transfer. The command reserves a private receipt before POST. A repeated
+`requestId` and identical input returns its original receipt without another
+credential lookup or POST; different input is `request_id_conflict`. The receipt
+stores a fingerprint and outcome, without message content or credentials.
+Failures and uncertain sends are never automatically retried. Preserve the
+`bot-requests` directory with the gateway data when moving or backing up the
+installation; deleting it loses duplicate suppression.
+
+JSON output contains `botId`, `requestId`, `status`, `duplicate`, `httpStatus`.
+`accepted` means the receiver returned HTTP success, not that the bot processed
+or answered the message. `failed` means a non-success HTTP response; `unknown`
+means delivery could not be confirmed, including interruption after reservation.
+All three are successful command executions (exit 0). Invalid input or routing,
+credential and host failures use exit 1 with a fixed diagnostic and no private
+provider output. Send can take the host-read deadlines, a 45-second credential
+lookup, and a 10-second HTTP attempt; callers should allow at least 90 seconds.
+Stdin is limited to 64 KiB and a five-second read deadline.
